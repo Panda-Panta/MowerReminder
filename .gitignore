@@ -1,0 +1,20 @@
+# Compiled binary and dependencies
+*.exe
+_internal/
+build/
+dist/
+*.spec
+单文件版/
+
+# User configuration and logs
+mower_config.ini
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Temporary and editor files
+*.bak
+.vscode/
+.idea/

@@ -43,13 +43,13 @@ except ImportError:
 
 # 仅在Windows上导入win32gui、win32con、win32event、win32api和winreg用于窗口操作和互斥体
 if platform.system() == "Windows":
+    import winreg
     try:
         import win32gui
         import win32con
         import win32event
         import win32api
         import winerror
-        # 注意：不再需要 winreg，因为已移除开机自启动
     except ImportError:
         logger.warning("警告: 未安装 pywin32 库。Windows 单实例、窗口激活功能可能受限。请运行 'pip install pywin32'")
         win32gui = None
@@ -57,6 +57,8 @@ if platform.system() == "Windows":
         win32event = None
         win32api = None
         winerror = None
+else:
+    winreg = None
 
 # 在Windows上设置标题栏深色模式
 try:
@@ -95,6 +97,7 @@ DEFAULT_CONFIG = {
         'font_size': '24',
         'font_weight': 'bold',
         'start_minimized': 'False',
+        'auto_start': 'False',
         'log_start_marker': '到',
         'log_end_marker': '开始工作',
         'notify_minutes_a': '5',
@@ -109,6 +112,8 @@ DEFAULT_CONFIG = {
 APP_TITLE = "Mower Reminder"
 ICON_FILE = "mower.ico"
 SINGLE_INSTANCE_PORT = 12345
+AUTO_START_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTO_START_VALUE_NAME = "MowerReminder"
 
 # --- 颜色配置 ---
 COLOR_NORMAL_BG = "#1e1e1e"
@@ -147,6 +152,7 @@ class CountdownApp:
         self.font_size = int(self.config.get('Settings', 'font_size'))
         self.font_weight = self.config.get('Settings', 'font_weight')
         self.start_minimized = self.config.getboolean('Settings', 'start_minimized')
+        self.auto_start = self.config.getboolean('Settings', 'auto_start')
         self.log_start_marker = self.config.get('Settings', 'log_start_marker')
         self.log_end_marker = self.config.get('Settings', 'log_end_marker')
         self.notify_minutes_a = int(self.config.get('Settings', 'notify_minutes_a'))
@@ -189,7 +195,12 @@ class CountdownApp:
 
         # 网址版 WebSocket 相关
         self.ws_thread = None
+        self.ws_app = None
         self.ws_stop_event = threading.Event()
+        self.ws_connected = False
+        self.ws_status_text = "正在连接 WebSocket..."
+        self.has_received_logs = False
+        self.has_finished_countdown = False
 
         # --- 窗口设置 ---
         self.root.overrideredirect(True)
@@ -349,6 +360,34 @@ class CountdownApp:
             logger.error(f"保存配置文件时出错: {e}")
             tk.messagebox.showerror("保存错误", f"保存配置文件时出错:\n{e}", parent=self.root)
 
+    # ---------- 开机自启动 ----------
+    def get_startup_command(self):
+        if getattr(sys, 'frozen', False):
+            return f'"{sys.executable}"'
+        script_path = os.path.abspath(sys.argv[0])
+        pythonw_path = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
+        if os.path.exists(pythonw_path):
+            return f'"{pythonw_path}" "{script_path}"'
+        return f'"{sys.executable}" "{script_path}"'
+
+    def set_auto_start(self, enable):
+        if platform.system() != "Windows" or winreg is None:
+            return False
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTO_START_RUN_KEY, 0, winreg.KEY_SET_VALUE)
+            if enable:
+                winreg.SetValueEx(key, AUTO_START_VALUE_NAME, 0, winreg.REG_SZ, self.get_startup_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, AUTO_START_VALUE_NAME)
+                except FileNotFoundError:
+                    pass
+            winreg.CloseKey(key)
+            return True
+        except Exception as e:
+            logger.error(f"设置开机自启动时出错: {e}")
+            return False
+
     # ---------- 界面控制 ----------
     def toggle_topmost(self):
         self.is_always_on_top = not self.is_always_on_top
@@ -443,11 +482,18 @@ class CountdownApp:
             self.scan_log_file()
 
     def _stop_data_source(self):
+        self.ws_connected = False
+        if self.ws_app:
+            try:
+                self.ws_app.close()
+            except Exception:
+                pass
+            self.ws_app = None
         if self.ws_thread and self.ws_thread.is_alive():
             self.ws_stop_event.set()
-            self.ws_thread.join(timeout=0.3)
+            self.ws_thread.join(timeout=1.0)
             if self.ws_thread.is_alive():
-                logger.info("[WS] WebSocket 线程未能在 0.3 秒内结束")
+                logger.info("[WS] WebSocket 线程未能在 1.0 秒内结束")
         self.ws_stop_event.clear()
         
     def restart_data_source(self):
@@ -495,32 +541,10 @@ class CountdownApp:
         try:
             lines = self._read_log_tail()
             for line in reversed(lines):
-                try:
-                    m = LOG_TIMESTAMP_RE.match(line)
-                    if not m:
-                        continue
-                    log_datetime = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
-
-                    start_pos = line.find(self.log_start_marker)
-                    if start_pos == -1:
-                        continue
-                    end_pos = line.find(self.log_end_marker, start_pos)
-                    if end_pos == -1:
-                        continue
-
-                    time_part_str = line[start_pos + len(self.log_start_marker):end_pos].strip()
-                    parsed_time = datetime.strptime(time_part_str, "%H:%M:%S").time()
-                    potential_task_time = datetime.combine(log_datetime.date(), parsed_time)
-
-                    if potential_task_time < log_datetime:
-                        potential_task_time += timedelta(days=1)
-
-                    if potential_task_time > now:
-                        if closest_future_time is None or potential_task_time < closest_future_time:
-                            closest_future_time = potential_task_time
-                except (ValueError, IndexError):
-                    continue
-
+                potential_task_time = self._parse_task_time_from_line(line)
+                if potential_task_time and potential_task_time > now:
+                    if closest_future_time is None or potential_task_time < closest_future_time:
+                        closest_future_time = potential_task_time
             self.next_task_time = closest_future_time
             self.log_parse_error_shown = False
         except Exception as e:
@@ -532,50 +556,81 @@ class CountdownApp:
     # ---------- 网址版：WebSocket 连接 ----------
     def start_websocket(self):
         if not has_websocket:
-            self._set_label_text("websocket-client 未安装")
+            self.ws_connected = False
+            self.ws_status_text = "未安装 websocket-client"
+            self._prev_display_text = None
             return
+        self.ws_connected = False
+        self.ws_status_text = "正在连接 WebSocket..."
+        self.has_received_logs = False
+        self._prev_display_text = None
         self.ws_stop_event.clear()
         self.ws_thread = threading.Thread(target=self._ws_run, daemon=True)
         self.ws_thread.start()
-        self._set_label_text("正在连接 WebSocket...")
 
     def _ws_run(self):
         while not self.ws_stop_event.is_set():
             try:
-                host = self.websocket_host.replace('http://', '').replace('https://', '').strip('/')
-                ws_url = f"ws://{host}:{self.websocket_port}/log?token={self.websocket_token}"
-                origin = f"http://{host}:{self.websocket_port}"
-                headers = {
-                    'Origin': origin,
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
+                raw_host = self.websocket_host.replace('http://', '').replace('https://', '').strip('/')
+                if ':' in raw_host:
+                    host, port_str = raw_host.split(':', 1)
+                    port = port_str.split('/')[0]
+                else:
+                    host = raw_host
+                    port = str(self.websocket_port).strip()
+                ws_url = f"ws://{host}:{port}/log"
                 logger.info(f"[WS] 尝试连接: {ws_url}")
+                self.ws_connected = False
+                self.ws_status_text = "正在连接 WebSocket..."
+                self._prev_display_text = None
+
+                # 注意：不能添加自定义 Origin / User-Agent 请求头，否则服务端会判定为 Unauthorized
                 ws = websocket.WebSocketApp(
                     ws_url,
-                    header=headers,
                     on_open=self._on_ws_open,
                     on_message=self._on_ws_message,
                     on_error=self._on_ws_error,
                     on_close=self._on_ws_close
                 )
+                self.ws_app = ws
                 ws.run_forever(ping_interval=30, ping_timeout=10)
             except Exception as e:
                 logger.error(f"[WS] 连接异常: {e}")
+                self.ws_connected = False
+                self.ws_status_text = f"连接异常: {str(e)[:20]}"
+                self._prev_display_text = None
+            self.ws_app = None
             if not self.ws_stop_event.is_set():
                 logger.info("[WS] 10秒后重连...")
+                self.ws_connected = False
+                self.ws_status_text = "连接断开，10秒后重连..."
+                self._prev_display_text = None
                 self.ws_stop_event.wait(10)
 
     def _on_ws_open(self, ws):
         logger.info("[WS] 连接成功！")
-        self.root.after(0, lambda: self._set_label_text("已连接"))
+        self.ws_connected = True
+        self.ws_status_text = "已连接，等待任务信号..."
+        self._prev_display_text = None
+        if self.websocket_token:
+            try:
+                ws.send(json.dumps({'token': self.websocket_token}))
+                logger.info("[WS] Token 认证消息已发送")
+            except Exception as e:
+                logger.error(f"[WS] 发送 Token 失败: {e}")
 
     def _on_ws_error(self, ws, error):
         logger.error(f"[WS] 错误: {error}")
-        self.root.after(0, lambda: self._set_label_text(f"连接错误: {str(error)[:30]}"))
+        self.ws_connected = False
+        self.ws_status_text = f"连接错误: {str(error)[:20]}"
+        self._prev_display_text = None
 
     def _on_ws_close(self, ws, close_status_code, close_msg):
         logger.info(f"[WS] 连接关闭: {close_status_code} {close_msg}")
-        self.root.after(0, lambda: self._set_label_text("连接关闭，重连中..."))
+        self.ws_connected = False
+        msg = f": {close_msg}" if close_msg else ""
+        self.ws_status_text = f"连接断开{msg}，重连中..."
+        self._prev_display_text = None
 
     def _on_ws_message(self, ws, message):
         try:
@@ -583,10 +638,17 @@ class CountdownApp:
             log_line = data.get('data', '')
             if not log_line:
                 return
-            for single_line in log_line.strip().split('\n'):
+            self.has_received_logs = True
+            lines = log_line.strip().split('\n')
+            found_time = None
+            now = datetime.now()
+            for single_line in reversed(lines):
                 task_time = self._parse_task_time_from_line(single_line)
-                if task_time:
-                    self.root.after(0, self._set_next_task_time, task_time)
+                if task_time and task_time > now:
+                    found_time = task_time
+                    break
+            if found_time:
+                self.root.after(0, self._set_next_task_time, found_time)
         except json.JSONDecodeError as e:
             logger.error(f"[WS] JSON 解析失败: {e}")
         except Exception as e:
@@ -599,14 +661,21 @@ class CountdownApp:
                 return None
             log_datetime = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
 
+            time_part_str = None
             start_pos = line.find(self.log_start_marker)
-            if start_pos == -1:
-                return None
-            end_pos = line.find(self.log_end_marker, start_pos)
-            if end_pos == -1:
+            if start_pos != -1:
+                end_pos = line.find(self.log_end_marker, start_pos + len(self.log_start_marker))
+                if end_pos != -1:
+                    time_part_str = line[start_pos + len(self.log_start_marker):end_pos].strip()
+
+            if not time_part_str:
+                fallback_match = re.search(r'下次任务在\s*(\d{2}:\d{2}:\d{2})', line)
+                if fallback_match:
+                    time_part_str = fallback_match.group(1)
+
+            if not time_part_str:
                 return None
 
-            time_part_str = line[start_pos + len(self.log_start_marker):end_pos].strip()
             parsed_time = datetime.strptime(time_part_str, "%H:%M:%S").time()
             potential_task_time = datetime.combine(log_datetime.date(), parsed_time)
 
@@ -625,7 +694,9 @@ class CountdownApp:
                     self.notified_a = False
                     self.notified_b = False
                     self.notified_c = False
+                    self.has_finished_countdown = False
                 self.next_task_time = new_time
+                self._prev_display_text = None
 
     # ---------- 设置窗口 ----------
     def show_settings_window(self, icon=None, item=None):
@@ -734,36 +805,38 @@ class CountdownApp:
         tk.Checkbutton(frame, text="启动时最小化到托盘", variable=self.start_minimized_var,
                        font=("Segoe UI", 11), bg=COLOR_FRAME_BG, fg=COLOR_TEXT, selectcolor=COLOR_BUTTON_BG).grid(row=10, column=0, columnspan=2, sticky="w", pady=5)
 
-        # 注意：开机自启动选项已移除
+        self.auto_start_var = tk.BooleanVar(value=self.auto_start)
+        tk.Checkbutton(frame, text="开机自启动", variable=self.auto_start_var,
+                       font=("Segoe UI", 11), bg=COLOR_FRAME_BG, fg=COLOR_TEXT, selectcolor=COLOR_BUTTON_BG).grid(row=11, column=0, columnspan=2, sticky="w", pady=5)
 
         # 通知设置
-        tk.Label(frame, text="通知设置", font=("Segoe UI", 12, "bold"), bg=COLOR_FRAME_BG, fg=COLOR_TEXT).grid(row=11, column=0, columnspan=3, sticky="w", pady=(10, 5))
+        tk.Label(frame, text="通知设置", font=("Segoe UI", 12, "bold"), bg=COLOR_FRAME_BG, fg=COLOR_TEXT).grid(row=12, column=0, columnspan=3, sticky="w", pady=(10, 5))
 
         self.notify_enabled_a_var = tk.BooleanVar(value=self.notify_enabled_a)
         tk.Checkbutton(frame, text="启用通知A (分钟)", variable=self.notify_enabled_a_var,
                        font=("Segoe UI", 11), bg=COLOR_FRAME_BG, fg=COLOR_TEXT, selectcolor=COLOR_BUTTON_BG,
-                       command=lambda: toggle_entry_state(self.notify_a_entry, self.notify_enabled_a_var)).grid(row=12, column=0, sticky="w", pady=5)
+                       command=lambda: toggle_entry_state(self.notify_a_entry, self.notify_enabled_a_var)).grid(row=13, column=0, sticky="w", pady=5)
         self.notify_a_entry = tk.Entry(frame, width=10, font=("Segoe UI", 10), bg=COLOR_BUTTON_BG, fg=COLOR_BUTTON_FG, insertbackground=COLOR_TEXT)
         self.notify_a_entry.insert(0, str(self.notify_minutes_a))
-        self.notify_a_entry.grid(row=12, column=1, sticky="w", pady=5, padx=5)
+        self.notify_a_entry.grid(row=13, column=1, sticky="w", pady=5, padx=5)
         toggle_entry_state(self.notify_a_entry, self.notify_enabled_a_var)
 
         self.notify_enabled_b_var = tk.BooleanVar(value=self.notify_enabled_b)
         tk.Checkbutton(frame, text="启用通知B (分钟)", variable=self.notify_enabled_b_var,
                        font=("Segoe UI", 11), bg=COLOR_FRAME_BG, fg=COLOR_TEXT, selectcolor=COLOR_BUTTON_BG,
-                       command=lambda: toggle_entry_state(self.notify_b_entry, self.notify_enabled_b_var)).grid(row=13, column=0, sticky="w", pady=5)
+                       command=lambda: toggle_entry_state(self.notify_b_entry, self.notify_enabled_b_var)).grid(row=14, column=0, sticky="w", pady=5)
         self.notify_b_entry = tk.Entry(frame, width=10, font=("Segoe UI", 10), bg=COLOR_BUTTON_BG, fg=COLOR_BUTTON_FG, insertbackground=COLOR_TEXT)
         self.notify_b_entry.insert(0, str(self.notify_minutes_b))
-        self.notify_b_entry.grid(row=13, column=1, sticky="w", pady=5, padx=5)
+        self.notify_b_entry.grid(row=14, column=1, sticky="w", pady=5, padx=5)
         toggle_entry_state(self.notify_b_entry, self.notify_enabled_b_var)
 
         self.notify_enabled_c_var = tk.BooleanVar(value=self.notify_enabled_c)
         tk.Checkbutton(frame, text="启用通知C (分钟)", variable=self.notify_enabled_c_var,
                        font=("Segoe UI", 11), bg=COLOR_FRAME_BG, fg=COLOR_TEXT, selectcolor=COLOR_BUTTON_BG,
-                       command=lambda: toggle_entry_state(self.notify_c_entry, self.notify_enabled_c_var)).grid(row=14, column=0, sticky="w", pady=5)
+                       command=lambda: toggle_entry_state(self.notify_c_entry, self.notify_enabled_c_var)).grid(row=15, column=0, sticky="w", pady=5)
         self.notify_c_entry = tk.Entry(frame, width=10, font=("Segoe UI", 10), bg=COLOR_BUTTON_BG, fg=COLOR_BUTTON_FG, insertbackground=COLOR_TEXT)
         self.notify_c_entry.insert(0, str(self.notify_minutes_c))
-        self.notify_c_entry.grid(row=14, column=1, sticky="w", pady=5, padx=5)
+        self.notify_c_entry.grid(row=15, column=1, sticky="w", pady=5, padx=5)
         toggle_entry_state(self.notify_c_entry, self.notify_enabled_c_var)
 
         save_button = tk.Button(frame, text="保存设置", command=self.save_settings,
@@ -771,7 +844,7 @@ class CountdownApp:
                                 bg=COLOR_BUTTON_BG, fg=COLOR_BUTTON_FG,
                                 activebackground=COLOR_BUTTON_ACTIVE_BG,
                                 bd=0, padx=10, pady=5, relief='flat')
-        save_button.grid(row=15, column=0, columnspan=3, pady=15)
+        save_button.grid(row=16, column=0, columnspan=3, pady=15)
 
         frame.grid_columnconfigure(1, weight=1)
 
@@ -887,7 +960,16 @@ class CountdownApp:
             self.config['Settings']['start_minimized'] = str(self.start_minimized)
             self._settings_changed = True
 
-        # 注意：已移除开机自启动相关代码
+        if self.auto_start_var.get() != self.auto_start:
+            new_auto_start = self.auto_start_var.get()
+            self.auto_start = new_auto_start
+            self.config['Settings']['auto_start'] = str(new_auto_start)
+            self._settings_changed = True
+            if platform.system() == "Windows":
+                if not self.set_auto_start(new_auto_start):
+                    tk.messagebox.showwarning("设置错误", "设置开机自启动失败，请检查权限。", parent=self.settings_window)
+            else:
+                tk.messagebox.showwarning("提示", "当前系统不支持开机自启动。", parent=self.settings_window)
 
         if not self._save_int_setting(self.notify_a_entry, 'notify_minutes_a', 'notify_minutes_a'):
             return
@@ -938,8 +1020,14 @@ class CountdownApp:
         self._stop_data_source()
         if hasattr(self, 'icon') and self.icon:
             self.icon.stop()
-        self.root.quit()
-        self.root.destroy()
+        try:
+            self.root.quit()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
         self._single_instance.release()
         logger.info("应用程序已退出。")
         sys.exit(0)
@@ -955,17 +1043,29 @@ class CountdownApp:
             self.scan_log_file()
             self.next_scan_time = now + timedelta(seconds=self.scan_interval_seconds)
 
-        display_text = "任务进行中..."
+        display_text = ""
         is_alert_mode = False
 
         if self.next_task_time is None or self.next_task_time <= now:
-            display_text = "任务进行中..."
             if self.next_task_time is not None and self.next_task_time <= now:
                 self.notified_a = False
                 self.notified_b = False
                 self.notified_c = False
                 self.notified_new_task_start = False
                 self.next_task_time = None
+                self.has_finished_countdown = True
+
+            if self.mode == 'web':
+                if not has_websocket:
+                    display_text = "缺少 websocket-client"
+                elif not self.ws_connected:
+                    display_text = self.ws_status_text or "WebSocket 未连接"
+                elif not self.has_received_logs and not getattr(self, 'has_finished_countdown', False):
+                    display_text = "已连接，等待信号..."
+                else:
+                    display_text = "任务进行中..."
+            else:
+                display_text = "任务进行中..."
         else:
             delta = self.next_task_time - now
             total_seconds = int(delta.total_seconds())
@@ -1009,10 +1109,19 @@ class CountdownApp:
             if self.flash_on:
                 current_bg = COLOR_ALERT_BG
 
-        if display_text != self._prev_display_text or current_bg != self._prev_bg:
-            self.label.config(text=display_text, bg=current_bg)
+        # 根据文本长度动态适配字体大小，避免长状态文本被截断
+        target_font_size = self.font_size if len(display_text) <= 10 else min(self.font_size, 13)
+        if (display_text != self._prev_display_text or 
+            current_bg != self._prev_bg or 
+            getattr(self, '_prev_font_size', None) != target_font_size):
+            self.label.config(
+                text=display_text, 
+                bg=current_bg, 
+                font=(self.font_family, target_font_size, self.font_weight)
+            )
             self._prev_display_text = display_text
             self._prev_bg = current_bg
+            self._prev_font_size = target_font_size
         self.root.after(self.update_interval_ms, self.update_countdown)
 
 
@@ -1083,6 +1192,13 @@ class SingleInstance:
 
 
 if __name__ == "__main__":
+    if getattr(sys, 'frozen', False):
+        script_dir = os.path.dirname(sys.executable)
+    else:
+        script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    if script_dir and os.path.isdir(script_dir):
+        os.chdir(script_dir)
+
     single_instance = SingleInstance(APP_TITLE, SINGLE_INSTANCE_PORT)
     if single_instance.try_acquire():
         root = tk.Tk()
