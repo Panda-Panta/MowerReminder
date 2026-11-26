@@ -14,6 +14,9 @@ import threading
 import json
 import re
 import logging
+import urllib.request
+import urllib.error
+import urllib.parse
 
 logging.basicConfig(
     level=logging.INFO,
@@ -125,6 +128,48 @@ COLOR_BUTTON_ACTIVE_BG = "#505050"
 COLOR_FRAME_BG = "#2e2e2e"
 
 LOG_TIMESTAMP_RE = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})')
+REST_UNTIL_RE = re.compile(
+    r'休息[^，,\n]*[，,]\s*至\s*(?:(\d{4}-\d{2}-\d{2}|\d{2}-\d{2})\s+)?(\d{2}:\d{2}:\d{2})(?:[^「\n]*随后执行「([^」]+)」)?'
+)
+NEXT_EXEC_UNTIL_RE = re.compile(
+    r'至\s*(?:(\d{4}-\d{2}-\d{2}|\d{2}-\d{2})\s+)?(\d{2}:\d{2}:\d{2})\s*[，,]\s*随后执行「([^」]+)」'
+)
+NEXT_TASK_AT_RE = re.compile(
+    r'下次任务在\s*(?:(\d{4}-\d{2}-\d{2}|\d{2}-\d{2})\s+)?(\d{2}:\d{2}:\d{2})'
+)
+
+MOWER_STATUS_LABELS = {
+    'stopped': 'Mower 已停止',
+    'starting': 'Mower 启动中...',
+    'recovering': '等待设备恢复...',
+    'sleeping': '休眠中...',
+    'running': '任务进行中...',
+}
+
+
+def parse_server_datetime(value):
+    """解析服务端返回的时间字符串（支持标准格式和 ISO8601，带时区时转为本地无时区时间）。"""
+    if not value or not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    normalized = text.replace(',', '.')
+    if normalized.endswith('Z'):
+        normalized = normalized[:-1] + '+00:00'
+    try:
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+        return dt
+    except ValueError:
+        pass
+    for fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S', '%Y/%m/%d %H:%M:%S'):
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+    return None
 
 def get_resource_path(relative_path):
     try:
@@ -173,6 +218,7 @@ class CountdownApp:
 
         # 状态变量
         self.next_task_time = None
+        self.next_task_name = None
         self._previous_task_time_state = None
         self.flash_on = False
         self.is_always_on_top = True
@@ -193,12 +239,22 @@ class CountdownApp:
         self.log_file_error_shown = False
         self.log_parse_error_shown = False
 
-        # 网址版 WebSocket 相关
+        # 网址版 WebSocket 与 HTTP /status 相关
         self.ws_thread = None
         self.ws_app = None
+        self.api_thread = None
         self.ws_stop_event = threading.Event()
         self.ws_connected = False
-        self.ws_status_text = "正在连接 WebSocket..."
+        self.ws_status_text = "正在连接服务器..."
+        self.ws_stream_id = None
+        self.ws_last_seq = 0
+        self.api_connected = False
+        self.api_supported = True
+        self.api_auth_failed = False
+        self.api_status_text = ""
+        self.mower_status = None
+        self.mower_maintenance_pause = None
+        self.status_poll_interval_seconds = 5
         self.has_received_logs = False
         self.has_finished_countdown = False
 
@@ -472,17 +528,24 @@ class CountdownApp:
     def _start_data_source(self):
         if self.mode == 'web':
             self._stop_data_source()
-            if has_websocket:
-                self.start_websocket()
-            else:
-                self._set_label_text("websocket-client 未安装")
+            self.next_task_time = None
+            self.next_task_name = None
+            self.has_finished_countdown = False
+            self.start_web_sources()
         else:  # local
             self._stop_data_source()
+            self.next_task_time = None
+            self.next_task_name = None
             self._set_label_text("本地模式，等待扫描...")
             self.scan_log_file()
 
     def _stop_data_source(self):
         self.ws_connected = False
+        self.api_connected = False
+        self.api_auth_failed = False
+        self.mower_status = None
+        self.mower_maintenance_pause = None
+        self.ws_stop_event.set()
         if self.ws_app:
             try:
                 self.ws_app.close()
@@ -490,10 +553,13 @@ class CountdownApp:
                 pass
             self.ws_app = None
         if self.ws_thread and self.ws_thread.is_alive():
-            self.ws_stop_event.set()
             self.ws_thread.join(timeout=1.0)
             if self.ws_thread.is_alive():
                 logger.info("[WS] WebSocket 线程未能在 1.0 秒内结束")
+        if self.api_thread and self.api_thread.is_alive():
+            self.api_thread.join(timeout=1.0)
+            if self.api_thread.is_alive():
+                logger.info("[API] 状态轮询线程未能在 1.0 秒内结束")
         self.ws_stop_event.clear()
         
     def restart_data_source(self):
@@ -537,48 +603,262 @@ class CountdownApp:
 
         now = datetime.now()
         closest_future_time = None
+        closest_task_name = None
 
         try:
             lines = self._read_log_tail()
             for line in reversed(lines):
-                potential_task_time = self._parse_task_time_from_line(line)
+                potential_task_time, task_name = self._parse_task_info_from_line(line)
                 if potential_task_time and potential_task_time > now:
                     if closest_future_time is None or potential_task_time < closest_future_time:
                         closest_future_time = potential_task_time
+                        closest_task_name = task_name
             self.next_task_time = closest_future_time
+            self.next_task_name = closest_task_name
             self.log_parse_error_shown = False
         except Exception as e:
             if not self.log_parse_error_shown:
                 tk.messagebox.showerror("文件读取错误", f"读取日志文件时出错:\n{e}\n请检查文件权限或内容。", parent=self.root)
                 self.log_parse_error_shown = True
             self.next_task_time = None
+            self.next_task_name = None
 
-    # ---------- 网址版：WebSocket 连接 ----------
-    def start_websocket(self):
-        if not has_websocket:
+    # ---------- 网址版：HTTP /status + WebSocket /log ----------
+    def _build_web_endpoints(self):
+        """解析配置中的网址、端口和 Token，返回 (http_base, ws_url, effective_token)。"""
+        raw = (self.websocket_host or "").strip()
+        if not raw:
+            return None, None, ""
+        if "://" not in raw:
+            raw = "http://" + raw
+        parsed = urllib.parse.urlparse(raw)
+        http_scheme = "https" if parsed.scheme.lower() in ("https", "wss") else "http"
+        ws_scheme = "wss" if http_scheme == "https" else "ws"
+
+        hostname = parsed.hostname or ""
+        if not hostname:
+            return None, None, ""
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+
+        port = parsed.port
+        if port is None:
+            cfg_port = str(self.websocket_port or "").strip()
+            if cfg_port:
+                port = cfg_port
+
+        base_path = (parsed.path or "").rstrip("/")
+        if base_path.endswith("/log"):
+            base_path = base_path[:-4]
+
+        netloc = f"{hostname}:{port}" if port else hostname
+        http_base = f"{http_scheme}://{netloc}{base_path}"
+        ws_url = f"{ws_scheme}://{netloc}{base_path}/log"
+
+        token = (self.websocket_token or "").strip()
+        if not token and parsed.query:
+            qs = urllib.parse.parse_qs(parsed.query)
+            token = (qs.get("token") or [""])[0].strip()
+
+        return http_base, ws_url, token
+
+    def start_web_sources(self):
+        http_base, ws_url, _ = self._build_web_endpoints()
+        if not http_base:
             self.ws_connected = False
-            self.ws_status_text = "未安装 websocket-client"
+            self.api_connected = False
+            self.ws_status_text = "未配置服务器网址"
+            self.api_status_text = "未配置服务器网址"
             self._prev_display_text = None
             return
-        self.ws_connected = False
-        self.ws_status_text = "正在连接 WebSocket..."
-        self.has_received_logs = False
-        self._prev_display_text = None
+
         self.ws_stop_event.clear()
-        self.ws_thread = threading.Thread(target=self._ws_run, daemon=True)
-        self.ws_thread.start()
+        self.ws_connected = False
+        self.api_connected = False
+        self.api_supported = True
+        self.api_auth_failed = False
+        self.mower_status = None
+        self.mower_maintenance_pause = None
+        self.ws_stream_id = None
+        self.ws_last_seq = 0
+        self.has_received_logs = False
+        self.ws_status_text = "正在连接服务器..."
+        self.api_status_text = "正在获取状态..."
+        self._prev_display_text = None
+
+        # 启动 HTTP /status 轮询线程（最新 Mower 权威状态接口）
+        self.api_thread = threading.Thread(target=self._status_poll_run, daemon=True)
+        self.api_thread.start()
+
+        # 启动 WebSocket /log 实时推送线程（实时日志与旧版兼容）
+        if has_websocket:
+            self.ws_thread = threading.Thread(target=self._ws_run, daemon=True)
+            self.ws_thread.start()
+        else:
+            self.ws_status_text = "未安装 websocket-client"
+
+    def start_websocket(self):
+        """保留兼容入口，统一启动网页数据源。"""
+        self.start_web_sources()
+
+    def _http_get_json(self, url, token, timeout=5):
+        headers = {}
+        if token:
+            headers['token'] = token
+        req = urllib.request.Request(url, headers=headers, method='GET')
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode('utf-8', errors='replace')
+            return json.loads(raw)
+
+    def _status_poll_run(self):
+        while not self.ws_stop_event.is_set():
+            if not self.api_supported:
+                return
+            http_base, _, token = self._build_web_endpoints()
+            if not http_base:
+                self.api_connected = False
+                self.api_status_text = "未配置服务器网址"
+                self.ws_stop_event.wait(self.status_poll_interval_seconds)
+                continue
+
+            status_url = f"{http_base}/status"
+            try:
+                data = self._http_get_json(status_url, token, timeout=5)
+                if isinstance(data, dict):
+                    # 若服务端处于休眠但 /status 未直接提供时间，兜底查询 /task
+                    if (
+                        str(data.get('status') or '').lower() == 'sleeping'
+                        and not data.get('next_task_time')
+                        and data.get('remaining_seconds') is None
+                    ):
+                        try:
+                            tasks = self._http_get_json(f"{http_base}/task", token, timeout=5)
+                            if isinstance(tasks, list):
+                                data['_fallback_tasks'] = tasks
+                        except Exception:
+                            pass
+                    self.root.after(0, self._apply_status_data, data)
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403):
+                    logger.error(f"[API] /status 鉴权失败 (HTTP {e.code})")
+                    self.api_connected = False
+                    self.api_auth_failed = True
+                    self.api_status_text = "Token 鉴权失败"
+                    self._prev_display_text = None
+                elif e.code == 404:
+                    logger.info("[API] 服务端不支持 /status 接口，回退至纯 WebSocket 日志模式")
+                    self.api_connected = False
+                    self.api_supported = False
+                    return
+                else:
+                    logger.error(f"[API] /status 请求失败: HTTP {e.code}")
+                    self.api_connected = False
+                    self.api_status_text = f"状态请求错误: HTTP {e.code}"
+                    self._prev_display_text = None
+            except Exception as e:
+                logger.warning(f"[API] /status 连接失败: {e}")
+                self.api_connected = False
+                self.api_auth_failed = False
+                self.api_status_text = "连接服务器失败，重连中..."
+                self._prev_display_text = None
+
+            self.ws_stop_event.wait(self.status_poll_interval_seconds)
+
+    def _apply_status_data(self, data):
+        now = datetime.now()
+        prev_status = self.mower_status
+        prev_pause = self.mower_maintenance_pause
+
+        self.api_connected = True
+        self.api_auth_failed = False
+        self.api_status_text = ""
+
+        status = str(data.get('status') or '').strip().lower()
+        self.mower_status = status or None
+        self.mower_maintenance_pause = data.get('maintenance_pause') if status != 'stopped' else None
+
+        if status == 'sleeping':
+            target_time = None
+            task_name = None
+            parsed_next = parse_server_datetime(data.get('next_task_time'))
+            rem = data.get('remaining_seconds')
+            has_rem = isinstance(rem, (int, float)) and not isinstance(rem, bool) and rem >= 0
+
+            if parsed_next and has_rem:
+                from_rem = now + timedelta(seconds=float(rem))
+                if abs((parsed_next - from_rem).total_seconds()) > 60:
+                    # 存在跨时区或较大时钟偏差时，以服务端 remaining_seconds 为准并防抖
+                    if (
+                        self.next_task_time is not None
+                        and abs((from_rem - self.next_task_time).total_seconds()) <= 3
+                    ):
+                        target_time = self.next_task_time
+                    else:
+                        target_time = from_rem
+                else:
+                    target_time = parsed_next
+            elif parsed_next:
+                target_time = parsed_next
+            elif has_rem and rem > 0:
+                from_rem = now + timedelta(seconds=float(rem))
+                if (
+                    self.next_task_time is not None
+                    and abs((from_rem - self.next_task_time).total_seconds()) <= 3
+                ):
+                    target_time = self.next_task_time
+                else:
+                    target_time = from_rem
+
+            # 若 /status 未提供时间，尝试从 /task 兜底获取最近未来任务
+            if target_time is None and isinstance(data.get('_fallback_tasks'), list):
+                for item in data['_fallback_tasks']:
+                    if not isinstance(item, dict):
+                        continue
+                    t_dt = parse_server_datetime(item.get('time'))
+                    if t_dt and t_dt > now:
+                        if target_time is None or t_dt < target_time:
+                            target_time = t_dt
+                            pres = item.get('presentation')
+                            task_name = (
+                                (pres.get('title') if isinstance(pres, dict) else None)
+                                or item.get('display_name')
+                            )
+
+            if target_time and target_time > now:
+                self._set_next_task_time(target_time, task_name=task_name)
+        elif status == 'stopped':
+            scheduled = parse_server_datetime(data.get('scheduled_start_at'))
+            if scheduled and scheduled > now:
+                self._set_next_task_time(scheduled, task_name="定时启动")
+            else:
+                self._clear_next_task_time(finished=False)
+        elif status in ('running', 'starting', 'recovering'):
+            self._clear_next_task_time(finished=(status == 'running'))
+
+        if prev_status != self.mower_status or prev_pause != self.mower_maintenance_pause:
+            self._prev_display_text = None
+
+    def _clear_next_task_time(self, finished=False):
+        if self.next_task_time is not None:
+            self.next_task_time = None
+            self.next_task_name = None
+            self.notified_a = False
+            self.notified_b = False
+            self.notified_c = False
+            self.notified_new_task_start = False
+            self.has_finished_countdown = finished
+            self._prev_display_text = None
 
     def _ws_run(self):
         while not self.ws_stop_event.is_set():
             try:
-                raw_host = self.websocket_host.replace('http://', '').replace('https://', '').strip('/')
-                if ':' in raw_host:
-                    host, port_str = raw_host.split(':', 1)
-                    port = port_str.split('/')[0]
-                else:
-                    host = raw_host
-                    port = str(self.websocket_port).strip()
-                ws_url = f"ws://{host}:{port}/log"
+                _, ws_url, _ = self._build_web_endpoints()
+                if not ws_url:
+                    self.ws_connected = False
+                    self.ws_status_text = "未配置服务器网址"
+                    self._prev_display_text = None
+                    self.ws_stop_event.wait(5)
+                    continue
                 logger.info(f"[WS] 尝试连接: {ws_url}")
                 self.ws_connected = False
                 self.ws_status_text = "正在连接 WebSocket..."
@@ -612,9 +892,10 @@ class CountdownApp:
         self.ws_connected = True
         self.ws_status_text = "已连接，等待任务信号..."
         self._prev_display_text = None
-        if self.websocket_token:
+        _, _, token = self._build_web_endpoints()
+        if token:
             try:
-                ws.send(json.dumps({'token': self.websocket_token}))
+                ws.send(json.dumps({'token': token}))
                 logger.info("[WS] Token 认证消息已发送")
             except Exception as e:
                 logger.error(f"[WS] 发送 Token 失败: {e}")
@@ -628,73 +909,192 @@ class CountdownApp:
     def _on_ws_close(self, ws, close_status_code, close_msg):
         logger.info(f"[WS] 连接关闭: {close_status_code} {close_msg}")
         self.ws_connected = False
-        msg = f": {close_msg}" if close_msg else ""
+        msg_str = close_msg.decode('utf-8', errors='replace') if isinstance(close_msg, bytes) else (close_msg or "")
+        msg = f": {msg_str}" if msg_str else ""
         self.ws_status_text = f"连接断开{msg}，重连中..."
         self._prev_display_text = None
 
     def _on_ws_message(self, ws, message):
         try:
             data = json.loads(message)
-            log_line = data.get('data', '')
-            if not log_line:
+            if not isinstance(data, dict):
                 return
-            self.has_received_logs = True
-            lines = log_line.strip().split('\n')
-            found_time = None
+            msg_type = data.get('type')
+            if msg_type and msg_type != 'log':
+                return
+
+            is_snapshot = bool(data.get('snapshot', False))
+            stream_id = data.get('stream_id')
+            if isinstance(stream_id, str) and stream_id and stream_id != self.ws_stream_id:
+                self.ws_stream_id = stream_id
+                self.ws_last_seq = 0
+
             now = datetime.now()
-            for single_line in reversed(lines):
-                task_time = self._parse_task_time_from_line(single_line)
-                if task_time and task_time > now:
-                    found_time = task_time
-                    break
+            found_time = None
+            found_name = None
+
+            # 优先解析新版结构化 records 数组
+            records = data.get('records')
+            if isinstance(records, list):
+                if records:
+                    self.has_received_logs = True
+                for rec in reversed(records):
+                    if not isinstance(rec, dict):
+                        continue
+                    seq = rec.get('seq')
+                    if isinstance(seq, int) and seq > self.ws_last_seq:
+                        self.ws_last_seq = seq
+                    if found_time is None:
+                        t_dt, t_name = self._parse_task_info_from_record(rec)
+                        if t_dt and t_dt > now:
+                            found_time = t_dt
+                            found_name = t_name
+
+            # 兜底解析传统纯文本 data 字段
+            if found_time is None:
+                log_line = data.get('data', '')
+                if isinstance(log_line, str) and log_line:
+                    self.has_received_logs = True
+                    for single_line in reversed(log_line.strip().split('\n')):
+                        t_dt, t_name = self._parse_task_info_from_line(single_line)
+                        if t_dt and t_dt > now:
+                            found_time = t_dt
+                            found_name = t_name
+                            break
+
             if found_time:
-                self.root.after(0, self._set_next_task_time, found_time)
+                self.root.after(0, self._handle_ws_task_signal, found_time, found_name, is_snapshot)
         except json.JSONDecodeError as e:
             logger.error(f"[WS] JSON 解析失败: {e}")
         except Exception as e:
             logger.error(f"[WS] 处理消息异常: {e}")
 
-    def _parse_task_time_from_line(self, line):
+    def _handle_ws_task_signal(self, found_time, found_name, is_snapshot):
+        # 若 /status 已确认 Mower 处于非休眠状态（如已停止或运行中），忽略历史 snapshot 中的旧休眠记录
+        if (
+            is_snapshot
+            and self.api_connected
+            and self.mower_status in ('stopped', 'running', 'starting', 'recovering')
+        ):
+            return
+        self._set_next_task_time(found_time, task_name=found_name)
+
+    def _parse_task_info_from_record(self, record):
+        """解析新版 WS 结构化日志 record，返回 (datetime | None, task_name | None)。"""
+        try:
+            task = record.get('task')
+            if isinstance(task, dict):
+                task_name = task.get('title') if isinstance(task.get('title'), str) and task.get('title').strip() else None
+                wait_seconds = task.get('wait_seconds')
+                if isinstance(wait_seconds, (int, float)) and not isinstance(wait_seconds, bool) and wait_seconds > 0:
+                    at_ms = record.get('at')
+                    if isinstance(at_ms, (int, float)) and not isinstance(at_ms, bool) and at_ms > 0:
+                        base_dt = datetime.fromtimestamp(float(at_ms) / 1000.0)
+                    else:
+                        base_dt = parse_server_datetime(record.get('t'))
+                    if base_dt:
+                        return base_dt + timedelta(seconds=float(wait_seconds)), task_name
+
+                header = task.get('header')
+                t_str = record.get('t') or ''
+                if isinstance(header, str) and header and t_str:
+                    dt, parsed_name = self._parse_task_info_from_line(f"{t_str} INFO {header}")
+                    if dt:
+                        return dt, task_name or parsed_name
+
+            t_str = record.get('t') or ''
+            level = record.get('level') or 'INFO'
+            msg = record.get('msg') or ''
+            if isinstance(msg, str) and msg:
+                first_line = msg.split('\n', 1)[0]
+                full_line = f"{t_str} {level} {first_line}" if t_str else first_line
+                return self._parse_task_info_from_line(full_line)
+        except Exception:
+            pass
+        return None, None
+
+    def _resolve_log_target_time(self, log_datetime, time_part_str, date_part_str=None):
+        parsed_time = datetime.strptime(time_part_str.strip(), "%H:%M:%S").time()
+        if date_part_str:
+            date_part_str = date_part_str.strip()
+            if len(date_part_str) == 10:  # YYYY-MM-DD
+                parsed_date = datetime.strptime(date_part_str, "%Y-%m-%d").date()
+                return datetime.combine(parsed_date, parsed_time)
+            if len(date_part_str) == 5:  # MM-DD
+                month, day = map(int, date_part_str.split('-'))
+                candidate = datetime(log_datetime.year, month, day, parsed_time.hour, parsed_time.minute, parsed_time.second)
+                if candidate < log_datetime - timedelta(days=1):
+                    candidate = datetime(log_datetime.year + 1, month, day, parsed_time.hour, parsed_time.minute, parsed_time.second)
+                return candidate
+
+        potential_task_time = datetime.combine(log_datetime.date(), parsed_time)
+        if potential_task_time < log_datetime:
+            potential_task_time += timedelta(days=1)
+        return potential_task_time
+
+    def _parse_task_info_from_line(self, line):
+        """解析单行日志中的下次任务时间与任务名，兼容新旧 Mower 日志格式。"""
         try:
             m = LOG_TIMESTAMP_RE.match(line)
             if not m:
-                return None
+                return None, None
             log_datetime = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
 
-            time_part_str = None
-            start_pos = line.find(self.log_start_marker)
-            if start_pos != -1:
-                end_pos = line.find(self.log_end_marker, start_pos + len(self.log_start_marker))
-                if end_pos != -1:
-                    time_part_str = line[start_pos + len(self.log_start_marker):end_pos].strip()
+            # 1. 优先匹配用户配置的起止标记（兼容旧版“到...开始工作”及自定义配置）
+            if self.log_start_marker and self.log_end_marker:
+                start_pos = line.find(self.log_start_marker)
+                if start_pos != -1:
+                    end_pos = line.find(self.log_end_marker, start_pos + len(self.log_start_marker))
+                    if end_pos != -1:
+                        raw_time = line[start_pos + len(self.log_start_marker):end_pos].strip()
+                        parts = raw_time.split()
+                        if len(parts) == 2:
+                            return self._resolve_log_target_time(log_datetime, parts[1], parts[0]), None
+                        return self._resolve_log_target_time(log_datetime, raw_time), None
 
-            if not time_part_str:
-                fallback_match = re.search(r'下次任务在\s*(\d{2}:\d{2}:\d{2})', line)
-                if fallback_match:
-                    time_part_str = fallback_match.group(1)
+            # 2. 匹配新版 Mower 休眠日志：“休息 1 小时 6 分 15 秒，至 [MM-DD ]22:54:01，随后执行「跑单」”
+            m_rest = REST_UNTIL_RE.search(line)
+            if m_rest:
+                date_part, time_part, task_name = m_rest.group(1), m_rest.group(2), m_rest.group(3)
+                return self._resolve_log_target_time(log_datetime, time_part, date_part), task_name
 
-            if not time_part_str:
-                return None
+            m_exec = NEXT_EXEC_UNTIL_RE.search(line)
+            if m_exec:
+                date_part, time_part, task_name = m_exec.group(1), m_exec.group(2), m_exec.group(3)
+                return self._resolve_log_target_time(log_datetime, time_part, date_part), task_name
 
-            parsed_time = datetime.strptime(time_part_str, "%H:%M:%S").time()
-            potential_task_time = datetime.combine(log_datetime.date(), parsed_time)
+            # 3. 兼容“下次任务在[日期 ]HH:MM:SS”格式
+            m_next = NEXT_TASK_AT_RE.search(line)
+            if m_next:
+                date_part, time_part = m_next.group(1), m_next.group(2)
+                return self._resolve_log_target_time(log_datetime, time_part, date_part), None
 
-            if potential_task_time < log_datetime:
-                potential_task_time += timedelta(days=1)
-            return potential_task_time
+            return None, None
         except (ValueError, IndexError):
-            return None
+            return None, None
 
-    def _set_next_task_time(self, new_time):
+    def _parse_task_time_from_line(self, line):
+        task_time, _ = self._parse_task_info_from_line(line)
+        return task_time
+
+    def _set_next_task_time(self, new_time, task_name=None):
         if new_time:
             now = datetime.now()
             if new_time > now:
-                if self.next_task_time is None or self.next_task_time <= now:
+                is_new_cycle = (
+                    self.next_task_time is None
+                    or self.next_task_time <= now
+                    or abs((new_time - self.next_task_time).total_seconds()) > 60
+                )
+                if is_new_cycle:
                     self.notified_new_task_start = False
                     self.notified_a = False
                     self.notified_b = False
                     self.notified_c = False
                     self.has_finished_countdown = False
+                    self.next_task_name = task_name
+                elif task_name:
+                    self.next_task_name = task_name
                 self.next_task_time = new_time
                 self._prev_display_text = None
 
@@ -1053,22 +1453,30 @@ class CountdownApp:
                 self.notified_c = False
                 self.notified_new_task_start = False
                 self.next_task_time = None
+                self.next_task_name = None
                 self.has_finished_countdown = True
 
             if self.mode == 'web':
-                if not has_websocket:
-                    display_text = "缺少 websocket-client"
-                elif not self.ws_connected:
-                    display_text = self.ws_status_text or "WebSocket 未连接"
-                elif not self.has_received_logs and not getattr(self, 'has_finished_countdown', False):
-                    display_text = "已连接，等待信号..."
+                if self.api_connected:
+                    if self.mower_maintenance_pause:
+                        display_text = "维护暂停中..."
+                    else:
+                        display_text = MOWER_STATUS_LABELS.get(self.mower_status, "任务进行中...")
+                elif self.api_auth_failed:
+                    display_text = self.api_status_text or "Token 鉴权失败"
+                elif self.ws_connected:
+                    if not self.has_received_logs and not getattr(self, 'has_finished_countdown', False):
+                        display_text = "已连接，等待信号..."
+                    else:
+                        display_text = "任务进行中..."
                 else:
-                    display_text = "任务进行中..."
+                    display_text = self.api_status_text or self.ws_status_text or "未连接服务器"
             else:
                 display_text = "任务进行中..."
         else:
             delta = self.next_task_time - now
             total_seconds = int(delta.total_seconds())
+            task_label = f"「{self.next_task_name}」" if self.next_task_name else "下次任务"
 
             if self._previous_task_time_state is None or self._previous_task_time_state <= now:
                 self.notified_a = False
@@ -1076,18 +1484,21 @@ class CountdownApp:
                 self.notified_c = False
                 if not self.notified_new_task_start:
                     new_minutes = total_seconds // 60
-                    message = f"休息约{new_minutes}分钟后进行下次任务" if new_minutes > 0 else "休息时间即将结束"
+                    if new_minutes > 0:
+                        message = f"休息约{new_minutes}分钟后执行{task_label}"
+                    else:
+                        message = f"休息时间即将结束，准备执行{task_label}"
                     self._send_notification(message, title=APP_TITLE)
                     self.notified_new_task_start = True
 
             if self.notify_enabled_a and total_seconds <= self.notify_minutes_a * 60 and not self.notified_a:
-                self._send_notification(f"任务即将开始: 剩余{self.notify_minutes_a}分钟!", title=APP_TITLE)
+                self._send_notification(f"{task_label}即将开始: 剩余{self.notify_minutes_a}分钟!", title=APP_TITLE)
                 self.notified_a = True
             if self.notify_enabled_b and total_seconds <= self.notify_minutes_b * 60 and not self.notified_b:
-                self._send_notification(f"任务即将开始: 剩余{self.notify_minutes_b}分钟!", title=APP_TITLE)
+                self._send_notification(f"{task_label}即将开始: 剩余{self.notify_minutes_b}分钟!", title=APP_TITLE)
                 self.notified_b = True
             if self.notify_enabled_c and total_seconds <= self.notify_minutes_c * 60 and not self.notified_c:
-                self._send_notification(f"任务即将开始: 剩余{self.notify_minutes_c}分钟!", title=APP_TITLE)
+                self._send_notification(f"{task_label}即将开始: 剩余{self.notify_minutes_c}分钟!", title=APP_TITLE)
                 self.notified_c = True
 
             if total_seconds <= self.alert_seconds:
