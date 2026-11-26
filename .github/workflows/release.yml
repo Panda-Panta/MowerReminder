@@ -2,17 +2,23 @@ name: Build and Release Windows EXE
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release 版本标签（例如 v1.2）'
-        required: true
+        description: 'Release 版本标签（留空则自动递增，例如 v1.3）'
+        required: false
         type: string
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-pipeline
+  cancel-in-progress: false
 
 jobs:
   build-and-release:
@@ -24,19 +30,77 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Resolve release tag
+        id: meta
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          git fetch --tags --force
+          $existingAtHead = @(git tag --points-at HEAD --list "v*" | Where-Object { $_ -and $_.Trim() })
+
+          if ($env:EVENT_NAME -eq "push" -and $env:REF_TYPE -eq "branch") {
+            if ($existingAtHead.Count -gt 0) {
+              Write-Host "HEAD already tagged with $($existingAtHead -join ', '); skipping duplicate release."
+              "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              exit 0
+            }
+
+            $latestTag = git tag -l "v*" --sort=-v:refname | Select-Object -First 1
+            if ($latestTag) {
+              $changedAppFiles = @(git diff --name-only "$latestTag..HEAD" -- "Mower Reminder.py" "mower.ico" "requirements.txt" | Where-Object { $_ -and $_.Trim() })
+              if ($changedAppFiles.Count -eq 0) {
+                Write-Host "No changes to app files since $latestTag; skipping release."
+                "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+                exit 0
+              }
+              Write-Host "App files changed since ${latestTag}: $($changedAppFiles -join ', ')"
+            }
+          }
+
+          if ($env:EVENT_NAME -eq "push" -and $env:REF_TYPE -eq "tag") {
+            $tag = $env:REF_NAME.Trim()
+          } elseif ($env:EVENT_NAME -eq "workflow_dispatch" -and $env:INPUT_TAG -and $env:INPUT_TAG.Trim()) {
+            $tag = $env:INPUT_TAG.Trim()
+          } else {
+            $latest = git tag -l "v*" --sort=-v:refname | Select-Object -First 1
+            if (-not $latest) {
+              $tag = "v1.0"
+            } elseif ($latest -match '^v(\d+)\.(\d+)\.(\d+)$') {
+              $tag = "v$($Matches[1]).$($Matches[2]).$([int]$Matches[3] + 1)"
+            } elseif ($latest -match '^v(\d+)\.(\d+)$') {
+              $tag = "v$($Matches[1]).$([int]$Matches[2] + 1)"
+            } elseif ($latest -match '^v(\d+)$') {
+              $tag = "v$($Matches[1]).1"
+            } else {
+              $shortSha = (git rev-parse --short HEAD).Trim()
+              $tag = "v0.0.$shortSha"
+            }
+          }
+
+          "skip=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Resolved release tag: $tag"
+
       - name: Set up Python 3.11
+        if: steps.meta.outputs.skip != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
       - name: Install dependencies
+        if: steps.meta.outputs.skip != 'true'
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
       - name: Build single-file EXE (MowerReminder.exe)
+        if: steps.meta.outputs.skip != 'true'
         shell: pwsh
         run: |
           pyinstaller --noconfirm --clean --windowed --onefile `
@@ -51,6 +115,7 @@ jobs:
           }
 
       - name: Build portable ZIP (MowerReminder.zip)
+        if: steps.meta.outputs.skip != 'true'
         shell: pwsh
         run: |
           pyinstaller --noconfirm --clean --windowed --onedir `
@@ -68,33 +133,18 @@ jobs:
           Compress-Archive -Path "dist_dir\Mower Reminder\*" -DestinationPath "dist\MowerReminder.zip" -Force
 
       - name: Verify artifacts
+        if: steps.meta.outputs.skip != 'true'
         shell: pwsh
         run: |
           Get-Item "dist\MowerReminder.exe", "dist\MowerReminder.zip" | Select-Object Name, Length
 
-      - name: Resolve release tag
-        id: meta
-        shell: pwsh
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_TAG: ${{ inputs.tag }}
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          if ($env:EVENT_NAME -eq "workflow_dispatch") {
-            $tag = $env:INPUT_TAG.Trim()
-          } else {
-            $tag = $env:REF_NAME.Trim()
-          }
-          if (-not $tag) {
-            throw "Release tag is empty"
-          }
-          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
       - name: Create GitHub Release
+        if: steps.meta.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
           files: |
             dist/MowerReminder.exe
