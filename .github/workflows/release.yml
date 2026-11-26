@@ -1,0 +1,101 @@
+name: Build and Release Windows EXE
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release 版本标签（例如 v1.2）'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build single-file EXE (MowerReminder.exe)
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onefile `
+            --name "MowerReminder" `
+            --icon "mower.ico" `
+            --add-data "mower.ico;." `
+            --hidden-import "pystray._win32" `
+            --collect-all "winotify" `
+            "Mower Reminder.py"
+          if (-not (Test-Path "dist\MowerReminder.exe")) {
+            throw "dist\MowerReminder.exe was not generated"
+          }
+
+      - name: Build portable ZIP (MowerReminder.zip)
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onedir `
+            --name "Mower Reminder" `
+            --icon "mower.ico" `
+            --add-data "mower.ico;." `
+            --hidden-import "pystray._win32" `
+            --collect-all "winotify" `
+            --distpath "dist_dir" `
+            --workpath "build_dir" `
+            "Mower Reminder.py"
+          if (-not (Test-Path "dist_dir\Mower Reminder\Mower Reminder.exe")) {
+            throw "dist_dir\Mower Reminder\Mower Reminder.exe was not generated"
+          }
+          Compress-Archive -Path "dist_dir\Mower Reminder\*" -DestinationPath "dist\MowerReminder.zip" -Force
+
+      - name: Verify artifacts
+        shell: pwsh
+        run: |
+          Get-Item "dist\MowerReminder.exe", "dist\MowerReminder.zip" | Select-Object Name, Length
+
+      - name: Resolve release tag
+        id: meta
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if ($env:EVENT_NAME -eq "workflow_dispatch") {
+            $tag = $env:INPUT_TAG.Trim()
+          } else {
+            $tag = $env:REF_NAME.Trim()
+          }
+          if (-not $tag) {
+            throw "Release tag is empty"
+          }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/MowerReminder.exe
+            dist/MowerReminder.zip
